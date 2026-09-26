@@ -15,14 +15,127 @@ from urllib.parse import urlparse
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
 VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
+DISPUTE_LOW_SCORE = 2
+DISPUTE_HIGH_SCORE = 4
+DISPUTE_REQUIRED_REVIEWS = 3
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('author','reviewer','chair')),
+    load_limit INTEGER NOT NULL DEFAULT 3 CHECK (load_limit >= 0)
+);
+CREATE TABLE IF NOT EXISTS papers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    author_id TEXT NOT NULL REFERENCES users(id),
+    title TEXT NOT NULL,
+    abstract TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted'
+        CHECK (status IN ('submitted','under_review','disputed','decided','withdrawn')),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (paper_id, version)
+);
+CREATE TABLE IF NOT EXISTS conflicts (
+    reviewer_id TEXT NOT NULL REFERENCES users(id),
+    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    reason TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (reviewer_id, paper_id)
+);
+CREATE TABLE IF NOT EXISTS bids (
+    reviewer_id TEXT NOT NULL REFERENCES users(id),
+    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    interest TEXT NOT NULL CHECK (interest IN ('want','maybe','decline')),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (reviewer_id, paper_id)
+);
+CREATE TABLE IF NOT EXISTS assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    reviewer_id TEXT NOT NULL REFERENCES users(id),
+    status TEXT NOT NULL DEFAULT 'invited'
+        CHECK (status IN ('invited','accepted','declined','completed')),
+    score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
+    review_text TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (paper_id, reviewer_id)
+);
+CREATE TABLE IF NOT EXISTS disputes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+    detected_at TEXT NOT NULL,
+    third_review_completed_at TEXT,
+    resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS dispute_review_invitations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispute_id INTEGER NOT NULL REFERENCES disputes(id),
+    assignment_id INTEGER NOT NULL UNIQUE REFERENCES assignments(id),
+    invited_by TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebuttals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+    author_id TEXT NOT NULL REFERENCES users(id),
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+    decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
+    note TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER,
+    actor_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (paper_id) REFERENCES papers(id)
+);
+"""
+LEGACY_TABLES = [
+    "users",
+    "papers",
+    "paper_versions",
+    "conflicts",
+    "bids",
+    "assignments",
+    "rebuttals",
+    "decisions",
+    "audit_log",
+]
 
 
 class BusinessError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
+    def __init__(
+        self,
+        message: str,
+        status: int = 400,
+        code: str = "bad_request",
+        details: dict | list | None = None,
+    ):
         super().__init__(message)
         self.message = message
         self.status = status
         self.code = code
+        self.details = details
 
 
 def utcnow() -> str:
@@ -45,85 +158,53 @@ class ReviewStore:
 
     def init_schema(self) -> None:
         with self._schema_lock, self.connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK (role IN ('author','reviewer','chair')),
-                    load_limit INTEGER NOT NULL DEFAULT 3 CHECK (load_limit >= 0)
-                );
-                CREATE TABLE IF NOT EXISTS papers (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    author_id TEXT NOT NULL REFERENCES users(id),
-                    title TEXT NOT NULL,
-                    abstract TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'submitted'
-                        CHECK (status IN ('submitted','under_review','decided','withdrawn')),
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS paper_versions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL REFERENCES papers(id),
-                    version INTEGER NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE (paper_id, version)
-                );
-                CREATE TABLE IF NOT EXISTS conflicts (
-                    reviewer_id TEXT NOT NULL REFERENCES users(id),
-                    paper_id INTEGER NOT NULL REFERENCES papers(id),
-                    reason TEXT NOT NULL,
-                    created_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (reviewer_id, paper_id)
-                );
-                CREATE TABLE IF NOT EXISTS bids (
-                    reviewer_id TEXT NOT NULL REFERENCES users(id),
-                    paper_id INTEGER NOT NULL REFERENCES papers(id),
-                    interest TEXT NOT NULL CHECK (interest IN ('want','maybe','decline')),
-                    note TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (reviewer_id, paper_id)
-                );
-                CREATE TABLE IF NOT EXISTS assignments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL REFERENCES papers(id),
-                    reviewer_id TEXT NOT NULL REFERENCES users(id),
-                    status TEXT NOT NULL DEFAULT 'invited'
-                        CHECK (status IN ('invited','accepted','declined','completed')),
-                    score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
-                    review_text TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (paper_id, reviewer_id)
-                );
-                CREATE TABLE IF NOT EXISTS rebuttals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
-                    author_id TEXT NOT NULL REFERENCES users(id),
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
-                    decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
-                    note TEXT NOT NULL DEFAULT '',
-                    decided_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER,
-                    actor_id TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (paper_id) REFERENCES papers(id)
-                );
-                """
-            )
+            conn.executescript(SCHEMA_SQL)
+            papers_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='papers'"
+            ).fetchone()
+            if papers_sql and "disputed" not in papers_sql[0]:
+                self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        """旧版数据库缺少 disputed 状态；重建表并保留既有数据。"""
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            snapshots: dict[str, tuple[list[str], list[tuple]]] = {}
+            for table in LEGACY_TABLES:
+                rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+                columns = [
+                    description[0]
+                    for description in conn.execute(f"SELECT * FROM {table} LIMIT 0").description
+                ]
+                snapshots[table] = (columns, [tuple(row) for row in rows])
+
+            conn.execute("BEGIN")
+            for table in reversed(LEGACY_TABLES):
+                conn.execute(f"DROP TABLE {table}")
+            conn.commit()
+
+            conn.executescript(SCHEMA_SQL)
+
+            conn.execute("BEGIN")
+            for table in LEGACY_TABLES:
+                columns, rows = snapshots[table]
+                if not rows:
+                    continue
+                placeholders = ",".join("?" for _ in columns)
+                column_list = ",".join(columns)
+                conn.executemany(
+                    f"INSERT INTO {table}({column_list}) VALUES({placeholders})",
+                    rows,
+                )
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(f"迁移后发现外键冲突: {violations}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     def seed(self) -> None:
         self.init_schema()
@@ -133,6 +214,7 @@ class ReviewStore:
             ("r1", "评审人一号", "reviewer", 3),
             ("r2", "评审人二号", "reviewer", 3),
             ("r3", "评审人三号", "reviewer", 2),
+            ("r4", "评审人四号", "reviewer", 3),
             ("chair", "程序委员会主席", "chair", 0),
         ]
         with self.connect() as conn:
@@ -158,6 +240,79 @@ class ReviewStore:
             "INSERT INTO audit_log(paper_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
             (paper_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), utcnow()),
         )
+
+    @staticmethod
+    def _has_score_dispute(scores: list[int]) -> bool:
+        return (
+            len(scores) >= 2
+            and min(scores) <= DISPUTE_LOW_SCORE
+            and max(scores) >= DISPUTE_HIGH_SCORE
+        )
+
+    def _dispute_candidates(self, conn: sqlite3.Connection, paper_id: int) -> list[dict]:
+        candidates = []
+        reviewers = conn.execute("SELECT * FROM users WHERE role='reviewer' ORDER BY id").fetchall()
+        for reviewer in reviewers:
+            assignment = conn.execute(
+                "SELECT * FROM assignments WHERE paper_id=? AND reviewer_id=?",
+                (paper_id, reviewer["id"]),
+            ).fetchone()
+            if assignment:
+                candidates.append(
+                    {
+                        "reviewer_id": reviewer["id"],
+                        "name": reviewer["name"],
+                        "eligible": False,
+                        "reason_code": "already_assigned",
+                        "reason": "该评审人已与此论文存在邀请、接受、拒绝或完成记录",
+                        "assignment_id": assignment["id"],
+                        "assignment_status": assignment["status"],
+                    }
+                )
+                continue
+
+            conflict = conn.execute(
+                "SELECT reason FROM conflicts WHERE paper_id=? AND reviewer_id=?",
+                (paper_id, reviewer["id"]),
+            ).fetchone()
+            if conflict:
+                candidates.append(
+                    {
+                        "reviewer_id": reviewer["id"],
+                        "name": reviewer["name"],
+                        "eligible": False,
+                        "reason_code": "conflict_of_interest",
+                        "reason": conflict["reason"],
+                    }
+                )
+                continue
+
+            load = conn.execute(
+                "SELECT COUNT(*) FROM assignments WHERE reviewer_id=? AND status IN ('invited','accepted')",
+                (reviewer["id"],),
+            ).fetchone()[0]
+            if load >= reviewer["load_limit"]:
+                candidates.append(
+                    {
+                        "reviewer_id": reviewer["id"],
+                        "name": reviewer["name"],
+                        "eligible": False,
+                        "reason_code": "reviewer_at_capacity",
+                        "reason": f"当前未完成分配 {load} 份，负载上限 {reviewer['load_limit']} 份",
+                        "current_load": load,
+                        "load_limit": reviewer["load_limit"],
+                    }
+                )
+                continue
+
+            candidates.append(
+                {
+                    "reviewer_id": reviewer["id"],
+                    "name": reviewer["name"],
+                    "eligible": True,
+                }
+            )
+        return candidates
 
     def submit_paper(self, user_id: str, title: str, abstract: str) -> dict:
         title, abstract = title.strip(), abstract.strip()
@@ -274,6 +429,8 @@ class ReviewStore:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
                 if not paper or paper["status"] not in {"submitted", "under_review"}:
+                    if paper and paper["status"] == "disputed":
+                        raise BusinessError("争议论文须通过复核邀请接口选择第三位评审人", 409, "dispute_review_required")
                     raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
                 reviewer = self._user(conn, reviewer_id)
                 self._require(reviewer, "reviewer")
@@ -322,17 +479,231 @@ class ReviewStore:
         with self.connect() as conn:
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "accepted":
-                raise BusinessError("只有已接受邀请的评审人可以提交评审", 409, "invalid_assignment_state")
-            conn.execute(
-                "UPDATE assignments SET status='completed',score=?,review_text=?,updated_at=? WHERE id=?",
-                (score, text.strip(), utcnow(), assignment_id),
-            )
-            self._audit(conn, row["paper_id"], reviewer_id, "review.submit", {"assignment_id": assignment_id, "score": score})
-            return {"id": assignment_id, "status": "completed", "score": score}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
+                if not row or row["reviewer_id"] != reviewer_id:
+                    raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
+                if row["status"] != "accepted":
+                    raise BusinessError("只有已接受邀请的评审人可以提交评审", 409, "invalid_assignment_state")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (row["paper_id"],)).fetchone()
+                if not paper or paper["status"] not in {"under_review", "disputed"}:
+                    raise BusinessError("论文当前不可提交评审", 409, "paper_unavailable")
+                now = utcnow()
+                conn.execute(
+                    "UPDATE assignments SET status='completed',score=?,review_text=?,updated_at=? WHERE id=?",
+                    (score, text.strip(), now, assignment_id),
+                )
+                self._audit(conn, row["paper_id"], reviewer_id, "review.submit", {"assignment_id": assignment_id, "score": score})
+
+                completed_rows = conn.execute(
+                    "SELECT score FROM assignments WHERE paper_id=? AND status='completed' ORDER BY id",
+                    (row["paper_id"],),
+                ).fetchall()
+                scores = [item["score"] for item in completed_rows]
+                dispute = conn.execute(
+                    "SELECT * FROM disputes WHERE paper_id=? AND resolved_at IS NULL",
+                    (row["paper_id"],),
+                ).fetchone()
+
+                if not dispute and paper["status"] == "under_review" and self._has_score_dispute(scores):
+                    cur = conn.execute(
+                        "INSERT INTO disputes(paper_id,detected_at) VALUES(?,?)",
+                        (row["paper_id"], now),
+                    )
+                    conn.execute("UPDATE papers SET status='disputed' WHERE id=?", (row["paper_id"],))
+                    self._audit(
+                        conn,
+                        row["paper_id"],
+                        "system",
+                        "dispute.detected",
+                        {
+                            "dispute_id": cur.lastrowid,
+                            "low_score": min(scores),
+                            "high_score": max(scores),
+                            "completed_reviews": len(scores),
+                            "required_reviews": DISPUTE_REQUIRED_REVIEWS,
+                        },
+                    )
+                elif dispute and len(scores) >= DISPUTE_REQUIRED_REVIEWS and not dispute["third_review_completed_at"]:
+                    conn.execute(
+                        "UPDATE disputes SET third_review_completed_at=? WHERE id=?",
+                        (now, dispute["id"]),
+                    )
+                    self._audit(
+                        conn,
+                        row["paper_id"],
+                        "system",
+                        "dispute.third_review_ready",
+                        {"dispute_id": dispute["id"], "completed_reviews": len(scores)},
+                    )
+
+                conn.commit()
+                return {"id": assignment_id, "status": "completed", "score": score}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_dispute_review_pool(self, chair_id: str, paper_id: int) -> dict:
+        """争议复核候选池：只负责筛选，不创建邀请。"""
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
+                raise BusinessError("论文不存在", 404, "not_found")
+            if paper["status"] != "disputed":
+                raise BusinessError("该论文当前没有待处理争议", 409, "not_disputed")
+            dispute = conn.execute(
+                "SELECT * FROM disputes WHERE paper_id=? AND resolved_at IS NULL",
+                (paper_id,),
+            ).fetchone()
+            if not dispute:
+                raise BusinessError("该论文没有待处理争议", 409, "dispute_resolved")
+
+            completed = conn.execute(
+                "SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'",
+                (paper_id,),
+            ).fetchone()[0]
+            pending = conn.execute(
+                """SELECT a.*, dri.id AS dispute_invitation_id
+                   FROM assignments a
+                   LEFT JOIN dispute_review_invitations dri ON dri.assignment_id=a.id
+                   WHERE a.paper_id=? AND a.status IN ('invited','accepted')
+                   ORDER BY a.id DESC LIMIT 1""",
+                (paper_id,),
+            ).fetchone()
+
+            candidates = self._dispute_candidates(conn, paper_id)
+            if completed >= DISPUTE_REQUIRED_REVIEWS:
+                state = "ready_for_decision"
+                message = "第三份复核意见已提交，主席可以作出决定"
+            elif pending:
+                state = "awaiting_review"
+                message = "复核邀请已发出，等待第三份意见"
+            else:
+                state = "awaiting_invitation"
+                message = "请从无利益冲突、未参与且未满负载的评审人中邀请一位复核人"
+
+            return {
+                "paper_id": paper_id,
+                "dispute_id": dispute["id"],
+                "state": state,
+                "message": message,
+                "completed_reviews": completed,
+                "required_reviews": DISPUTE_REQUIRED_REVIEWS,
+                "pending_assignment": (
+                    {
+                        "assignment_id": pending["id"],
+                        "dispute_invitation_id": pending["dispute_invitation_id"],
+                        "status": pending["status"],
+                    }
+                    if pending
+                    else None
+                ),
+                "eligible": [candidate for candidate in candidates if candidate["eligible"]],
+                "excluded": [candidate for candidate in candidates if not candidate["eligible"]],
+            }
+
+    def invite_dispute_review(self, chair_id: str, paper_id: int, reviewer_id: str) -> dict:
+        """争议复核邀请：与候选筛选、最终主席决定分开维护。"""
+        reviewer_id = reviewer_id.strip()
+        if not reviewer_id:
+            raise BusinessError("必须指定复核评审人", 422, "reviewer_required")
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                if paper["status"] != "disputed":
+                    raise BusinessError("只能为争议状态论文邀请复核人", 409, "not_disputed")
+                dispute = conn.execute(
+                    "SELECT * FROM disputes WHERE paper_id=? AND resolved_at IS NULL",
+                    (paper_id,),
+                ).fetchone()
+                if not dispute:
+                    raise BusinessError("该论文没有待处理争议", 409, "dispute_resolved")
+
+                completed = conn.execute(
+                    "SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'",
+                    (paper_id,),
+                ).fetchone()[0]
+                if completed >= DISPUTE_REQUIRED_REVIEWS:
+                    raise BusinessError("第三份复核意见已经提交，主席可以作出决定", 409, "dispute_review_ready")
+
+                pending = conn.execute(
+                    """SELECT a.*, dri.id AS dispute_invitation_id
+                       FROM assignments a
+                       LEFT JOIN dispute_review_invitations dri ON dri.assignment_id=a.id
+                       WHERE a.paper_id=? AND a.status IN ('invited','accepted')
+                       ORDER BY a.id DESC LIMIT 1""",
+                    (paper_id,),
+                ).fetchone()
+                if pending:
+                    raise BusinessError(
+                        "已有一份复核邀请等待回应或提交",
+                        409,
+                        "dispute_invitation_pending",
+                        {"assignment_id": pending["id"], "status": pending["status"]},
+                    )
+
+                reviewer = self._user(conn, reviewer_id)
+                self._require(reviewer, "reviewer")
+                existing = conn.execute(
+                    "SELECT * FROM assignments WHERE paper_id=? AND reviewer_id=?",
+                    (paper_id, reviewer_id),
+                ).fetchone()
+                if existing:
+                    raise BusinessError(
+                        "该评审人已与此论文存在邀请、接受、拒绝或完成记录",
+                        409,
+                        "already_assigned",
+                        {"assignment_id": existing["id"], "status": existing["status"]},
+                    )
+                conflict = conn.execute(
+                    "SELECT reason FROM conflicts WHERE paper_id=? AND reviewer_id=?",
+                    (paper_id, reviewer_id),
+                ).fetchone()
+                if conflict:
+                    raise BusinessError("评审人与论文存在利益冲突", 409, "conflict_of_interest")
+                load = conn.execute(
+                    "SELECT COUNT(*) FROM assignments WHERE reviewer_id=? AND status IN ('invited','accepted')",
+                    (reviewer_id,),
+                ).fetchone()[0]
+                if load >= reviewer["load_limit"]:
+                    raise BusinessError("评审人已达到负载上限", 409, "reviewer_at_capacity")
+
+                now = utcnow()
+                assignment_cur = conn.execute(
+                    "INSERT INTO assignments(paper_id,reviewer_id,created_at,updated_at) VALUES(?,?,?,?)",
+                    (paper_id, reviewer_id, now, now),
+                )
+                assignment_id = assignment_cur.lastrowid
+                invitation_cur = conn.execute(
+                    "INSERT INTO dispute_review_invitations(dispute_id,assignment_id,invited_by,created_at) VALUES(?,?,?,?)",
+                    (dispute["id"], assignment_id, chair_id, now),
+                )
+                self._audit(
+                    conn,
+                    paper_id,
+                    chair_id,
+                    "dispute.review_invite",
+                    {"dispute_id": dispute["id"], "assignment_id": assignment_id},
+                )
+                conn.commit()
+                return {
+                    "id": invitation_cur.lastrowid,
+                    "dispute_id": dispute["id"],
+                    "assignment_id": assignment_id,
+                    "paper_id": paper_id,
+                    "status": "invited",
+                }
+            except Exception:
+                conn.rollback()
+                raise
 
     def submit_rebuttal(self, author_id: str, paper_id: int, content: str) -> dict:
         if len(content.strip()) < 10:
@@ -365,16 +736,30 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
+                if not paper or paper["status"] not in {"submitted", "under_review", "disputed"}:
                     raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
                 completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
                 if completed < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                dispute = conn.execute(
+                    "SELECT * FROM disputes WHERE paper_id=? AND resolved_at IS NULL",
+                    (paper_id,),
+                ).fetchone()
+                if dispute and completed < DISPUTE_REQUIRED_REVIEWS:
+                    raise BusinessError(
+                        "争议论文必须收到第三份复核意见后才能作出决定",
+                        409,
+                        "dispute_review_pending",
+                        {"completed_reviews": completed, "required_reviews": DISPUTE_REQUIRED_REVIEWS},
+                    )
+                now = utcnow()
                 cur = conn.execute(
                     "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
-                    (paper_id, decision, note.strip(), chair_id, utcnow()),
+                    (paper_id, decision, note.strip(), chair_id, now),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
+                if dispute:
+                    conn.execute("UPDATE disputes SET resolved_at=? WHERE id=?", (now, dispute["id"]))
                 self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
                 return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
             except Exception:
@@ -455,6 +840,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 5 and parts[3:5] == ["dispute", "review-candidates"] and method == "GET":
+                return self._send(200, store.get_dispute_review_pool(self._user_id(), paper_id))
+            if len(parts) == 5 and parts[3:5] == ["dispute", "invitation"] and method == "POST":
+                data = self._body()
+                return self._send(201, store.invite_dispute_review(self._user_id(), paper_id, data.get("reviewer_id", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
@@ -479,7 +869,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         try:
             self._dispatch(method)
         except BusinessError as exc:
-            self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+            error = {"code": exc.code, "message": exc.message}
+            if exc.details is not None:
+                error["details"] = exc.details
+            self._send(exc.status, {"error": error})
         except ValueError:
             self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc:
